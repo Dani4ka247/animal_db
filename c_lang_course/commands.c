@@ -7,8 +7,25 @@
 #include <time.h>
 #include <ctype.h>
 
-int app_init(App *app, const char *filename) { return db_init(&app->db, filename); }
-void app_free(App *app) { db_free(&app->db); }
+static int history_load(History *h);
+static void history_free(History *h);
+static void history_init(History *h, const char *filename);
+static int history_add(History *h, const char *line);
+
+int app_init(App *app, const char *filename) {
+    memset(&app->undo, 0, sizeof(app->undo));
+    app->undo.type = UNDO_NONE;
+
+    if (db_init(&app->db, filename) < 0) return -1;
+    history_init(&app->hist, HISTORY_FILE);
+    if (history_load(&app->hist) < 0) return -1;
+    return 0;
+}
+
+void app_free(App *app) {
+    history_free(&app->hist);
+    db_free(&app->db);
+}
 
 static int cmd_help(App *app, size_t argc, char **argv);
 static int cmd_add(App *app, size_t argc, char **argv);
@@ -20,39 +37,61 @@ static int cmd_edit(App *app, size_t argc, char **argv);
 static int cmd_sort(App *app, size_t argc, char **argv);
 static int cmd_find(App *app, size_t argc, char **argv);
 static int cmd_stats(App *app, size_t argc, char **argv);
+static int cmd_history(App *app, size_t argc, char **argv);
+static int cmd_undo(App *app, size_t argc, char **argv);
 
+static const Command table[] = {
+    {"help",    cmd_help,    "help [command]", "Выводит описание команды"},
+    {"add",     cmd_add,     "add <name> <species> <breed> <age> <M/F|Male/Female>", "Добавляет новый объект в базу данных (дата ставится автоматически)"},
+    {"show",    cmd_list,    "show [n]", "Выводит содержимое коллекции (первые n записей)"},
+    {"save",    cmd_save,    "save [file.csv|file.bin|file]", "Сохраняет базу в CSV или BIN; без расширения -> .csv"},
+    {"load",    cmd_load,    "load <file.csv|file.bin|file>", "Загружает базу из CSV или BIN; без расширения сначала ищет .csv, потом .bin"},
+    {"del",     cmd_del,     "del <id>", "Удаляет запись по ID (с подтверждением)"},
+    {"edit",    cmd_edit,    "edit <id> <field>=<value> ...", "Редактирует поля записи по ID; можно также field = value"},
+    {"sort",    cmd_sort,    "sort <field> [asc|desc] <field> [asc|desc] ...", "Сортирует по нескольким полям (по умолчанию asc). Поля: id,name,species,breed,age,gender,date"},
+    {"find",    cmd_find,    "find <field> <value>", "Поиск записей по полю (строки — подстрока без регистра)"},
+    {"stats",   cmd_stats,   "stats", "Показывает статистику по текущей базе"},
+    {"history", cmd_history, "history", "Показывает историю команд"},
+    {"undo",    cmd_undo,    "undo", "Отменяет последнее изменение (add/edit/del)"},
+    {NULL, NULL, NULL, NULL}
+};
 
+typedef enum {
+    FMT_UNKNOWN = 0,
+    FMT_CSV,
+    FMT_BIN
+} FileFormat;
 
-static int has_csv_ext(const char *s) {
+typedef enum { S_ID, S_NAME, S_SPECIES, S_BREED, S_AGE, S_GENDER, S_DATE } SortKey;
+
+typedef struct {
+    SortKey key;
+    int desc;
+} SortSpec;
+
+static SortSpec g_specs[8];
+static size_t g_specs_n = 0;
+
+static FileFormat detect_format(const char *s) {
     const char *dot = strrchr(s, '.');
-    return dot && strcasecmp(dot, ".csv") == 0;
+    if (!dot) return FMT_UNKNOWN;
+    if (strcasecmp(dot, ".csv") == 0) return FMT_CSV;
+    if (strcasecmp(dot, ".bin") == 0) return FMT_BIN;
+    return FMT_UNKNOWN;
 }
 
-static int make_csv_name(const char *in, char *out, size_t outsz) {
+static int make_default_name(const char *in, char *out, size_t outsz, FileFormat fmt) {
     if (!in || !in[0]) return -1;
-    if (has_csv_ext(in)) {
+
+    if (detect_format(in) != FMT_UNKNOWN) {
         int need = snprintf(out, outsz, "%s", in);
         return (need < 0 || (size_t)need >= outsz) ? -1 : 0;
     }
-    int need = snprintf(out, outsz, "%s.csv", in);
+
+    const char *ext = (fmt == FMT_BIN) ? ".bin" : ".csv";
+    int need = snprintf(out, outsz, "%s%s", in, ext);
     return (need < 0 || (size_t)need >= outsz) ? -1 : 0;
 }
-
-
-static const Command table[] = {
-    {"help", cmd_help, "help [command]", "Выводит описание команды"},
-    {"add",  cmd_add,  "add <name> <species> <breed> <age> <M/F|Male/Female>", "Добавляет новый объект в базу данных (дата ставится автоматически)"},
-    {"show", cmd_list, "show [n]", "Выводит содержимое коллекции (первые n записей)"},
-    {"save", cmd_save, "save [файл|файл.csv]", "Сохраняет текущую базу в файл (.csv добавится автоматически)"},
-    {"load", cmd_load, "load <файл|файл.csv>", "Загружает базу из файла (.csv добавится автоматически)"},
-    {"del",  cmd_del,  "del <id>", "Удаляет запись по ID (с подтверждением)"},
-    {"edit", cmd_edit, "edit <id> <field>=<value> ...", "Редактирует поля записи по ID; можно также field = value"},
-    {"sort", cmd_sort, "sort <field> [asc|desc] <field> [asc|desc] ...",
-     "Сортирует по нескольким полям (по умолчанию asc). Поля: id,name,species,breed,age,gender,date"},
-    {"find", cmd_find, "find <field> <value>", "Поиск записей по полю (строки — подстрока без регистра)"},
-    {"stats", cmd_stats, "stats", "Показывает статистику по текущей базе"},
-    {NULL, NULL, NULL, NULL}
-};
 
 static int contains_icase_ascii(const char *hay, const char *needle) {
     if (!hay || !needle) return 0;
@@ -87,7 +126,6 @@ static int cmd_find(App *app, size_t argc, char **argv) {
 
     const char *field = argv[1];
     const char *value = argv[2];
-
     size_t found = 0;
 
     for (size_t i = 0; i < app->db.count; i++) {
@@ -136,7 +174,6 @@ static int cmd_find(App *app, size_t argc, char **argv) {
 
             printf("%-4u %-10.10s %-10.10s %-10.10s %4d %-2c %-10s\n",
                    a->id, a->name, a->species, a->breed, a->age, a->gender, datebuf);
-
             found++;
         }
     }
@@ -150,7 +187,6 @@ static int cmd_stats(App *app, size_t argc, char **argv) {
 
     size_t n = app->db.count;
     printf("Записей: %zu\n", n);
-
     if (n == 0) return 0;
 
     size_t male = 0, female = 0, other = 0;
@@ -181,7 +217,6 @@ static int cmd_stats(App *app, size_t argc, char **argv) {
     printf("Возраст: min=%d, max=%d, avg=%.2f\n", min_age, max_age, avg_age);
     return 0;
 }
-
 
 static int cmd_help(App *app, size_t argc, char **argv) {
     (void)app;
@@ -222,8 +257,6 @@ static int cmd_list(App *app, size_t argc, char **argv) {
     return 0;
 }
 
-
-
 static int cmd_save(App *app, size_t argc, char **argv) {
     const char *arg = (argc >= 2) ? argv[1] : app->db.filename;
     if (!arg || arg[0] == '\0') {
@@ -231,26 +264,37 @@ static int cmd_save(App *app, size_t argc, char **argv) {
         return 0;
     }
 
+    FileFormat fmt = detect_format(arg);
     char file[256];
-    if (make_csv_name(arg, file, sizeof file) < 0) {
-        printf("Ошибка: слишком длинное имя файла\n");
-        return 0;
+
+    if (fmt == FMT_UNKNOWN) {
+        if (make_default_name(arg, file, sizeof file, FMT_CSV) < 0) {
+            printf("Ошибка: слишком длинное имя файла\n");
+            return 0;
+        }
+        fmt = FMT_CSV;
+    } else {
+        if (snprintf(file, sizeof file, "%s", arg) >= (int)sizeof file) {
+            printf("Ошибка: слишком длинное имя файла\n");
+            return 0;
+        }
     }
 
-    if (argc < 2) printf("Сохраняю в текущий файл: %s\n", file);
-
     errno = 0;
-    if (db_save_csv(&app->db, file) < 0) {
+    int rc = -1;
+
+    if (fmt == FMT_CSV) rc = db_save_csv(&app->db, file);
+    else if (fmt == FMT_BIN) rc = db_save_bin(&app->db, file);
+
+    if (rc < 0) {
         perror("save");
         return 0;
     }
 
-    if (strcmp(app->db.filename, file) != 0) {
-        strncpy(app->db.filename, file, sizeof(app->db.filename)-1);
-        app->db.filename[sizeof(app->db.filename)-1] = '\0';
-    }
-
+    strncpy(app->db.filename, file, sizeof(app->db.filename) - 1);
+    app->db.filename[sizeof(app->db.filename) - 1] = '\0';
     app->db.dirty = 0;
+
     printf("saved: %s\n", app->db.filename);
     return 0;
 }
@@ -261,23 +305,53 @@ static int cmd_load(App *app, size_t argc, char **argv) {
         return 0;
     }
 
+    const char *arg = argv[1];
+    FileFormat fmt = detect_format(arg);
+
     char file[256];
-    if (make_csv_name(argv[1], file, sizeof file) < 0) {
-        printf("Ошибка: слишком длинное имя файла\n");
-        return 0;
+    int rc = -1;
+
+    if (fmt == FMT_CSV || fmt == FMT_BIN) {
+        if (snprintf(file, sizeof file, "%s", arg) >= (int)sizeof file) {
+            printf("Ошибка: слишком длинное имя файла\n");
+            return 0;
+        }
+
+        if (fmt == FMT_CSV) rc = db_load_csv(&app->db, file);
+        else rc = db_load_bin(&app->db, file);
+    } else {
+        char csvfile[256];
+        char binfile[256];
+
+        if (make_default_name(arg, csvfile, sizeof csvfile, FMT_CSV) < 0 ||
+            make_default_name(arg, binfile, sizeof binfile, FMT_BIN) < 0) {
+            printf("Ошибка: слишком длинное имя файла\n");
+            return 0;
+        }
+
+        rc = db_load_csv(&app->db, csvfile);
+        if (rc == 0) {
+            strncpy(file, csvfile, sizeof file - 1);
+            file[sizeof file - 1] = '\0';
+        } else {
+            rc = db_load_bin(&app->db, binfile);
+            if (rc == 0) {
+                strncpy(file, binfile, sizeof file - 1);
+                file[sizeof file - 1] = '\0';
+            }
+        }
     }
 
-    if (db_load_csv(&app->db, file) < 0) {
+    if (rc < 0) {
         perror("load");
         return 0;
     }
 
-    strncpy(app->db.filename, file, sizeof(app->db.filename)-1);
-    app->db.filename[sizeof(app->db.filename)-1] = '\0';
+    strncpy(app->db.filename, file, sizeof(app->db.filename) - 1);
+    app->db.filename[sizeof(app->db.filename) - 1] = '\0';
     printf("loaded: %s\n", app->db.filename);
     return 0;
 }
-
 
 static int cmd_add(App *app, size_t argc, char **argv) {
     if (argc != 6) {
@@ -288,9 +362,9 @@ static int cmd_add(App *app, size_t argc, char **argv) {
     Animal a;
     memset(&a, 0, sizeof a);
 
-    strncpy(a.name, argv[1], MAX_NAME-1);
-    strncpy(a.species, argv[2], MAX_SPECIES-1);
-    strncpy(a.breed, argv[3], MAX_BREED-1);
+    strncpy(a.name, argv[1], MAX_NAME - 1);
+    strncpy(a.species, argv[2], MAX_SPECIES - 1);
+    strncpy(a.breed, argv[3], MAX_BREED - 1);
 
     a.age = (int)strtol(argv[4], NULL, 10);
 
@@ -299,38 +373,80 @@ static int cmd_add(App *app, size_t argc, char **argv) {
         a.gender = 'M';
     else if (strcasecmp(gender_s, "F") == 0 || strcasecmp(gender_s, "FEMALE") == 0 || strcmp(gender_s, "ж") == 0)
         a.gender = 'F';
-    else { printf("bad gender, use M/F/Male/Female/м/ж\n"); return 0; }
+    else {
+        printf("bad gender, use M/F/Male/Female/м/ж\n");
+        return 0;
+    }
 
-    if (a.age < 0 || a.age > 100) { printf("bad age\n"); return 0; }
+    if (a.age < 0 || a.age > 100) {
+        printf("bad age\n");
+        return 0;
+    }
 
     time_t now = time(NULL);
     struct tm *lt = localtime(&now);
-    if (!lt) { printf("Ошибка времени\n"); return 0; }
+    if (!lt) {
+        printf("Ошибка времени\n");
+        return 0;
+    }
     a.admission = *lt;
 
-    if (db_add(&app->db, &a) < 0) printf("add failed (no memory)\n");
-    else printf("added id=%u\n", app->db.next_id - 1);
+    if (db_add(&app->db, &a) < 0) {
+        printf("add failed (no memory)\n");
+    } else {
+        unsigned int new_id = app->db.next_id - 1;
+        Animal *added = db_find_by_id(&app->db, new_id);
+
+        app->undo.type = UNDO_ADD;
+        app->undo.valid = 1;
+        app->undo.pos = app->db.count - 1;
+        memset(&app->undo.before, 0, sizeof(app->undo.before));
+        memset(&app->undo.after, 0, sizeof(app->undo.after));
+        if (added) app->undo.after = *added;
+
+        printf("added id=%u\n", new_id);
+    }
+
     return 0;
 }
 
-
 static int cmd_del(App *app, size_t argc, char **argv) {
-    if (argc < 2) { printf("Использование: del <id>\n"); return 0; }
+    if (argc < 2) {
+        printf("Использование: del <id>\n");
+        return 0;
+    }
 
     unsigned int id = (unsigned int)strtoul(argv[1], NULL, 10);
     Animal *a = db_find_by_id(&app->db, id);
-    if (!a) { printf("Не найдено: id=%u\n", id); return 0; }
+    if (!a) {
+        printf("Не найдено: id=%u\n", id);
+        return 0;
+    }
+
+    Animal backup = *a;
+    size_t pos = (size_t)(a - app->db.items);
 
     printf("Удалить id=%u (%s, %s, %s)? [y/n] ", a->id, a->name, a->species, a->breed);
     char ans[16];
     if (!fgets(ans, sizeof ans, stdin)) return 0;
-    if (!(ans[0] == 'y' || ans[0] == 'Y')) { printf("Отменено\n"); return 0; }
+    if (!(ans[0] == 'y' || ans[0] == 'Y')) {
+        printf("Отменено\n");
+        return 0;
+    }
 
-    if (db_delete_by_id(&app->db, id) < 0) printf("Ошибка удаления\n");
-    else printf("Удалено id=%u\n", id);
+    if (db_delete_by_id(&app->db, id) < 0) {
+        printf("Ошибка удаления\n");
+    } else {
+        app->undo.type = UNDO_DEL;
+        app->undo.valid = 1;
+        app->undo.before = backup;
+        memset(&app->undo.after, 0, sizeof(app->undo.after));
+        app->undo.pos = pos;
+
+        printf("Удалено id=%u\n", id);
+    }
     return 0;
 }
-
 
 static int take_assignment(size_t argc, char **argv, size_t *i,
                            const char **field, const char **value,
@@ -353,7 +469,6 @@ static int take_assignment(size_t argc, char **argv, size_t *i,
         *eq2 = '\0';
         *field = tmp;
         *value = eq2 + 1;
-
         *i += 2;
         return 0;
     }
@@ -371,8 +486,12 @@ static int cmd_edit(App *app, size_t argc, char **argv) {
 
     unsigned int id = (unsigned int)strtoul(argv[1], NULL, 10);
     Animal *a = db_find_by_id(&app->db, id);
-    if (!a) { printf("Не найдено: id=%u\n", id); return 0; }
+    if (!a) {
+        printf("Не найдено: id=%u\n", id);
+        return 0;
+    }
 
+    Animal old = *a;
     int changed = 0;
 
     for (size_t i = 2; i < argc; i++) {
@@ -387,31 +506,40 @@ static int cmd_edit(App *app, size_t argc, char **argv) {
 
         if (strcasecmp(field, "age") == 0) {
             int age = (int)strtol(value, NULL, 10);
-            if (age < 0 || age > 100) { printf("bad age\n"); continue; }
+            if (age < 0 || age > 100) {
+                printf("bad age\n");
+                continue;
+            }
             a->age = age;
             changed = 1;
         } else if (strcasecmp(field, "breed") == 0) {
-            strncpy(a->breed, value, MAX_BREED-1);
-            a->breed[MAX_BREED-1] = '\0';
+            strncpy(a->breed, value, MAX_BREED - 1);
+            a->breed[MAX_BREED - 1] = '\0';
             changed = 1;
         } else if (strcasecmp(field, "name") == 0) {
-            strncpy(a->name, value, MAX_NAME-1);
-            a->name[MAX_NAME-1] = '\0';
+            strncpy(a->name, value, MAX_NAME - 1);
+            a->name[MAX_NAME - 1] = '\0';
             changed = 1;
         } else if (strcasecmp(field, "species") == 0) {
-            strncpy(a->species, value, MAX_SPECIES-1);
-            a->species[MAX_SPECIES-1] = '\0';
+            strncpy(a->species, value, MAX_SPECIES - 1);
+            a->species[MAX_SPECIES - 1] = '\0';
             changed = 1;
         } else if (strcasecmp(field, "gender") == 0 || strcasecmp(field, "sex") == 0) {
             if (strcasecmp(value, "M") == 0 || strcasecmp(value, "MALE") == 0 || strcmp(value, "м") == 0)
                 a->gender = 'M';
             else if (strcasecmp(value, "F") == 0 || strcasecmp(value, "FEMALE") == 0 || strcmp(value, "ж") == 0)
                 a->gender = 'F';
-            else { printf("bad gender\n"); continue; }
+            else {
+                printf("bad gender\n");
+                continue;
+            }
             changed = 1;
         } else if (strcasecmp(field, "date") == 0 || strcasecmp(field, "admission") == 0) {
             struct tm t;
-            if (parse_date_ddmmyyyy(value, &t) < 0) { printf("bad date\n"); continue; }
+            if (parse_date_ddmmyyyy(value, &t) < 0) {
+                printf("bad date\n");
+                continue;
+            }
             a->admission = t;
             changed = 1;
         } else {
@@ -421,23 +549,19 @@ static int cmd_edit(App *app, size_t argc, char **argv) {
 
     if (changed) {
         app->db.dirty = 1;
+
+        app->undo.type = UNDO_EDIT;
+        app->undo.valid = 1;
+        app->undo.before = old;
+        app->undo.after = *a;
+        app->undo.pos = 0;
+
         printf("Обновлено id=%u\n", id);
     } else {
         printf("Нечего менять\n");
     }
     return 0;
 }
-
-
-typedef enum { S_ID, S_NAME, S_SPECIES, S_BREED, S_AGE, S_GENDER, S_DATE } SortKey;
-
-typedef struct {
-    SortKey key;
-    int desc;
-} SortSpec;
-
-static SortSpec g_specs[8];
-static size_t g_specs_n = 0;
 
 static int cmp_u(unsigned int a, unsigned int b) { return (a > b) - (a < b); }
 static int cmp_i(int a, int b) { return (a > b) - (a < b); }
@@ -534,6 +658,11 @@ static int cmd_sort(App *app, size_t argc, char **argv) {
     qsort(app->db.items, app->db.count, sizeof(Animal), animal_cmp_multi);
     app->db.dirty = 1;
 
+    if (db_rebuild_id_index(&app->db) < 0) {
+        printf("Ошибка перестроения индекса\n");
+        return 0;
+    }
+
     printf("Отсортировано по: ");
     for (size_t i = 0; i < g_specs_n; i++) {
         printf("%s %s%s",
@@ -542,6 +671,51 @@ static int cmd_sort(App *app, size_t argc, char **argv) {
                (i + 1 < g_specs_n) ? ", " : "\n");
     }
 
+    return 0;
+}
+
+static int cmd_undo(App *app, size_t argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    if (!app->undo.valid || app->undo.type == UNDO_NONE) {
+        printf("Нечего отменять\n");
+        return 0;
+    }
+
+    if (app->undo.type == UNDO_ADD) {
+        unsigned int id = app->undo.after.id;
+        if (db_delete_by_id(&app->db, id) < 0) {
+            printf("undo failed\n");
+            return 0;
+        }
+        printf("Отменено добавление id=%u\n", id);
+    } else if (app->undo.type == UNDO_EDIT) {
+        Animal *a = db_find_by_id(&app->db, app->undo.after.id);
+        if (!a) {
+            printf("undo failed\n");
+            return 0;
+        }
+
+        *a = app->undo.before;
+        app->db.dirty = 1;
+
+        if (db_rebuild_id_index(&app->db) < 0) {
+            printf("undo failed\n");
+            return 0;
+        }
+
+        printf("Отменено редактирование id=%u\n", a->id);
+    } else if (app->undo.type == UNDO_DEL) {
+        if (db_insert_raw(&app->db, &app->undo.before, app->undo.pos) < 0) {
+            printf("undo failed\n");
+            return 0;
+        }
+        printf("Отменено удаление id=%u\n", app->undo.before.id);
+    }
+
+    app->undo.valid = 0;
+    app->undo.type = UNDO_NONE;
     return 0;
 }
 
@@ -555,4 +729,86 @@ int commands_execute(App *app, size_t argc, char **argv) {
     }
 
     return c->fn(app, argc, argv);
+}
+
+static int history_grow(History *h) {
+    size_t ncap = h->cap ? h->cap * 2 : 32;
+    char **p = realloc(h->items, ncap * sizeof(char *));
+    if (!p) return -1;
+    h->items = p;
+    h->cap = ncap;
+    return 0;
+}
+
+static void history_init(History *h, const char *filename) {
+    memset(h, 0, sizeof(*h));
+    if (filename && *filename) {
+        strncpy(h->filename, filename, sizeof(h->filename) - 1);
+        h->filename[sizeof(h->filename) - 1] = '\0';
+    } else {
+        strcpy(h->filename, HISTORY_FILE);
+    }
+}
+
+static void history_free(History *h) {
+    for (size_t i = 0; i < h->count; i++) free(h->items[i]);
+    free(h->items);
+    h->items = NULL;
+    h->count = h->cap = 0;
+}
+
+static int history_add_mem(History *h, const char *line) {
+    if (!line || !*line) return 0;
+    if (h->count == h->cap && history_grow(h) < 0) return -1;
+
+    char *copy = malloc(strlen(line) + 1);
+    if (!copy) return -1;
+    strcpy(copy, line);
+
+    h->items[h->count++] = copy;
+    return 0;
+}
+
+static int history_append_file(const History *h, const char *line) {
+    FILE *f = fopen(h->filename, "a");
+    if (!f) return -1;
+    if (fprintf(f, "%s\n", line) < 0) {
+        fclose(f);
+        return -1;
+    }
+    return fclose(f);
+}
+
+static int history_add(History *h, const char *line) {
+    if (history_add_mem(h, line) < 0) return -1;
+    if (history_append_file(h, line) < 0) return -1;
+    return 0;
+}
+
+static int history_load(History *h) {
+    FILE *f = fopen(h->filename, "r");
+    if (!f) return 0;
+
+    char line[HISTORY_LINE];
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
+        if (history_add_mem(h, line) < 0) {
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static int cmd_history(App *app, size_t argc, char **argv) {
+    (void)argc;
+    (void)argv;
+
+    for (size_t i = 0; i < app->hist.count; i++) {
+        printf("%4zu  %s\n", i + 1, app->hist.items[i]);
+    }
+    return 0;
 }
