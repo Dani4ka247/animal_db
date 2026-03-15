@@ -31,7 +31,6 @@ typedef struct {
 
 typedef struct {
     Database db;
-    History hist;
     UndoState undo;
 } App;
 

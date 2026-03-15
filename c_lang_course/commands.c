@@ -7,23 +7,15 @@
 #include <time.h>
 #include <ctype.h>
 
-static int history_load(History *h);
-static void history_free(History *h);
-static void history_init(History *h, const char *filename);
-static int history_add(History *h, const char *line);
-
 int app_init(App *app, const char *filename) {
     memset(&app->undo, 0, sizeof(app->undo));
     app->undo.type = UNDO_NONE;
 
     if (db_init(&app->db, filename) < 0) return -1;
-    history_init(&app->hist, HISTORY_FILE);
-    if (history_load(&app->hist) < 0) return -1;
     return 0;
 }
 
 void app_free(App *app) {
-    history_free(&app->hist);
     db_free(&app->db);
 }
 
@@ -37,7 +29,6 @@ static int cmd_edit(App *app, size_t argc, char **argv);
 static int cmd_sort(App *app, size_t argc, char **argv);
 static int cmd_find(App *app, size_t argc, char **argv);
 static int cmd_stats(App *app, size_t argc, char **argv);
-static int cmd_history(App *app, size_t argc, char **argv);
 static int cmd_undo(App *app, size_t argc, char **argv);
 
 static const Command table[] = {
@@ -51,7 +42,6 @@ static const Command table[] = {
     {"sort",    cmd_sort,    "sort <field> [asc|desc] <field> [asc|desc] ...", "Сортирует по нескольким полям (по умолчанию asc). Поля: id,name,species,breed,age,gender,date"},
     {"find",    cmd_find,    "find <field> <value>", "Поиск записей по полю (строки — подстрока без регистра)"},
     {"stats",   cmd_stats,   "stats", "Показывает статистику по текущей базе"},
-    {"history", cmd_history, "history", "Показывает историю команд"},
     {"undo",    cmd_undo,    "undo", "Отменяет последнее изменение (add/edit/del)"},
     {NULL, NULL, NULL, NULL}
 };
@@ -731,84 +721,3 @@ int commands_execute(App *app, size_t argc, char **argv) {
     return c->fn(app, argc, argv);
 }
 
-static int history_grow(History *h) {
-    size_t ncap = h->cap ? h->cap * 2 : 32;
-    char **p = realloc(h->items, ncap * sizeof(char *));
-    if (!p) return -1;
-    h->items = p;
-    h->cap = ncap;
-    return 0;
-}
-
-static void history_init(History *h, const char *filename) {
-    memset(h, 0, sizeof(*h));
-    if (filename && *filename) {
-        strncpy(h->filename, filename, sizeof(h->filename) - 1);
-        h->filename[sizeof(h->filename) - 1] = '\0';
-    } else {
-        strcpy(h->filename, HISTORY_FILE);
-    }
-}
-
-static void history_free(History *h) {
-    for (size_t i = 0; i < h->count; i++) free(h->items[i]);
-    free(h->items);
-    h->items = NULL;
-    h->count = h->cap = 0;
-}
-
-static int history_add_mem(History *h, const char *line) {
-    if (!line || !*line) return 0;
-    if (h->count == h->cap && history_grow(h) < 0) return -1;
-
-    char *copy = malloc(strlen(line) + 1);
-    if (!copy) return -1;
-    strcpy(copy, line);
-
-    h->items[h->count++] = copy;
-    return 0;
-}
-
-static int history_append_file(const History *h, const char *line) {
-    FILE *f = fopen(h->filename, "a");
-    if (!f) return -1;
-    if (fprintf(f, "%s\n", line) < 0) {
-        fclose(f);
-        return -1;
-    }
-    return fclose(f);
-}
-
-static int history_add(History *h, const char *line) {
-    if (history_add_mem(h, line) < 0) return -1;
-    if (history_append_file(h, line) < 0) return -1;
-    return 0;
-}
-
-static int history_load(History *h) {
-    FILE *f = fopen(h->filename, "r");
-    if (!f) return 0;
-
-    char line[HISTORY_LINE];
-    while (fgets(line, sizeof line, f)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        if (line[0] == '\0') continue;
-        if (history_add_mem(h, line) < 0) {
-            fclose(f);
-            return -1;
-        }
-    }
-
-    fclose(f);
-    return 0;
-}
-
-static int cmd_history(App *app, size_t argc, char **argv) {
-    (void)argc;
-    (void)argv;
-
-    for (size_t i = 0; i < app->hist.count; i++) {
-        printf("%4zu  %s\n", i + 1, app->hist.items[i]);
-    }
-    return 0;
-}
